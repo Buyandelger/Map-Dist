@@ -35,10 +35,10 @@ Scroll up over the map to zoom in toward the cursor, and scroll down to zoom out
 ## Calculate a distribution
 
 1. Save the same numeric Element at two or more distinct Point locations. Use consistent units, such as °C for every Temperature entry.
-2. Select a Point and an Element from the lists, then click **Calculate**.
+2. Select a Point and an Element from the lists. Its IDW overlay updates automatically; selecting As shows As, and selecting Cr replaces it with Cr. **Calculate** recomputes the current selection.
 3. Read the predicted values using the color range in the legend. Select **Clear distribution** to remove the overlay.
 
-The calculation takes the latest numeric reading for that Element at each Point, matches names without regard to case, and averages readings at identical coordinates. It uses the nearest 12 distinct locations to the selected Point, including the selected location, with IDW power 2. Distances use a local approximation centered at the selected Point, so choose measurements in the same study area. The overlay is generated on demand.
+The calculation takes the latest numeric reading for that Element at each Point, matches names without regard to case, and averages readings at identical coordinates. It uses the nearest 12 distinct locations to the selected Point, including the selected location, with IDW power 2. Distances use a local approximation centered at the selected Point, so choose measurements in the same study area. The overlay is generated when the selection changes, without moving your map view. Changing Points preserves the selected Element name when available. If a distribution cannot be calculated, the legend explains why and the previous overlay is removed.
 
 For Esri's [ArcGIS Spatial Analyst IDW tool](https://pro.arcgis.com/en/pro-app/latest/tool-reference/spatial-analyst/idw.htm), run the app from the project folder with ArcGIS Pro and an available Spatial Analyst license. The ArcGIS Python environment needs Tkinter.
 

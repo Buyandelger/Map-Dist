@@ -53,7 +53,8 @@ class RecordList:
     def select(self, identifier):
         row = str(identifier)
         if self.tree.exists(row):
-            self.tree.selection_set(row)
+            if self.tree.selection() != (row,):
+                self.tree.selection_set(row)
             self.tree.focus(row)
             self.tree.see(row)
 
@@ -137,10 +138,14 @@ class RecordPanel:
     def point_selected(self, event=None):
         selected = self.point_list.selected_id()
         if selected != self.point_id:
+            previous = self.elements.get(self.element_id)
+            element_id = next((key for key, element in self.elements.items()
+                               if element.point_id == selected and previous is not None
+                               and element.name.casefold() == previous.name.casefold()), None)
             self.point_id = selected
             self.point_list.update_actions(True)
             self.status.set("")
-            self.show_elements()
+            self.show_elements(element_id)
 
     def element_selected(self, event=None):
         selected = self.element_list.selected_id()

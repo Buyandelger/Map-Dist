@@ -87,6 +87,9 @@ class ElementMap:
         self.surface_images = []
         self.surface_colors = []
         self.pending = False
+        self.distribution_request = 0
+        self.distribution_job = None
+        self.distribution_selection = None
         self.measurement_revision = 0
         self.map_selection = None
 
@@ -237,8 +240,6 @@ class ElementMap:
             self.dragged = False
             self.schedule_redraw(1, replace=True)
         elif event.num == 1:
-            if self.redraw_job is not None:
-                self.draw_map()
             self.pick_location(event)
 
     def preview_pan(self):
@@ -327,6 +328,7 @@ class ElementMap:
             self.contour_info.configure(text="")
         water_labels = self.draw_water(terrain, viewport)
 
+        canvas.create_line(0, 0, 0, 0, state="hidden", tags=("surface-layer",))
         self.draw_surface()
         occupied = []
         for minimum_zoom, is_city, _, label, longitude, latitude in self.labels:
@@ -344,6 +346,11 @@ class ElementMap:
             if self.reserve_label(x, y, name, width, height, occupied):
                 canvas.create_text(x, y, text=name, fill="#285d77", font=("Segoe UI", 9, "italic"))
 
+        self.draw_points()
+
+    def draw_points(self):
+        canvas = self.canvas
+        canvas.delete("points")
         selected = self.records.point_id
         for identifier, point in self.records.points.items():
             if not point.located:
@@ -353,7 +360,7 @@ class ElementMap:
             tag = f"point-{identifier}"
             canvas.create_oval(x - radius, y - radius, x + radius, y + radius,
                                fill="#bd422f" if selected == identifier else "#095b72",
-                               outline="white", width=2, tags=(tag,))
+                               outline="white", width=2, tags=(tag, "points"))
         if selected is not None:
             canvas.tag_raise(f"point-{selected}")
 
@@ -552,7 +559,12 @@ class ElementMap:
     def selection_changed(self):
         if self.map_selection != self.records.point_id:
             self.map_selection = self.records.point_id
-            self.schedule_redraw(1)
+            self.draw_points()
+        selection = (self.records.point_id, self.records.element_id, self.measurement_revision)
+        if selection != self.distribution_selection:
+            self.distribution_selection = selection
+            self.clear_surface()
+            self.distribution_job = self.root.after(120, self.calculate_distribution)
         self.refresh_calculate()
 
     def refresh_calculate(self):
@@ -565,13 +577,22 @@ class ElementMap:
         self.records.calculate_button.state(["!disabled"] if eligible else ["disabled"])
 
     def calculate_distribution(self):
+        if self.distribution_job is not None:
+            self.root.after_cancel(self.distribution_job)
+            self.distribution_job = None
         element = self.records.elements.get(self.records.element_id)
         if self.pending or element is None:
             return
+        point = self.records.points.get(element.point_id)
+        if point is None or not point.located:
+            self.legend.configure(text="Set coordinates on the selected Point to show IDW.")
+            return
+        self.distribution_request += 1
+        request = self.distribution_request
         point_id, metric = element.point_id, element.name
         self.pending = True
         self.refresh_calculate()
-        self.legend.configure(text=f"Calculating {metric}?")
+        self.legend.configure(text=f"Calculating {metric}…")
         future = Future()
         points, measurements = self.records.points.copy(), self.store.load_measurements()
 
@@ -582,22 +603,20 @@ class ElementMap:
                 future.set_exception(error)
 
         Thread(target=calculate, daemon=True).start()
-        self.root.after(75, self.show_distribution, future, points[point_id].name, metric, self.measurement_revision)
+        self.root.after(75, self.show_distribution, future, points[point_id].name, metric, self.measurement_revision, request)
 
-    def show_distribution(self, future, point_name, metric, revision):
+    def show_distribution(self, future, point_name, metric, revision, request):
+        if request != self.distribution_request or revision != self.measurement_revision:
+            return
         if not future.done():
-            self.root.after(75, self.show_distribution, future, point_name, metric, revision)
+            self.root.after(75, self.show_distribution, future, point_name, metric, revision, request)
             return
         self.pending = False
         self.refresh_calculate()
-        if revision != self.measurement_revision:
-            self.legend.configure(text="Measurements changed. Select Calculate to update the distribution.")
-            return
         try:
             surface = future.result()
         except Exception as error:
-            self.legend.configure(text=self.surface_caption if self.surface else "")
-            messagebox.showerror("Could not calculate distribution", str(error), parent=self.root)
+            self.legend.configure(text=f"{metric}: {error}")
             return
         self.surface = surface
         self.surface_colors = [[raster_color(value, surface.minimum, surface.maximum) for value in row]
@@ -607,7 +626,8 @@ class ElementMap:
         self.surface_caption = f"{point_name} · {metric} | {surface.engine} | {surface.samples} locations\n{limits}"
         self.legend.configure(text=self.surface_caption)
         self.clear_button.state(["!disabled"])
-        self.focus_surface(surface)
+        self.canvas.delete("distribution")
+        self.draw_surface()
 
     def focus_surface(self, surface):
         width, height = self.canvas.winfo_width(), self.canvas.winfo_height()
@@ -621,11 +641,18 @@ class ElementMap:
         self.draw_map()
 
     def clear_surface(self):
+        self.distribution_request += 1
+        if self.distribution_job is not None:
+            self.root.after_cancel(self.distribution_job)
+            self.distribution_job = None
+        self.pending = False
         self.surface = None
         self.surface_colors = []
         self.legend.configure(text="")
         self.clear_button.state(["disabled"])
-        self.draw_map()
+        self.canvas.delete("distribution")
+        self.surface_images = []
+        self.refresh_calculate()
 
     def draw_surface(self):
         self.surface_images = []
@@ -649,14 +676,18 @@ class ElementMap:
             data = png_image(x1 - x0, y1 - y0, (pixel_rows[index] for index in row_indices))
             image = tk.PhotoImage(master=canvas, data=data, format="png")
             self.surface_images.append(image)
-            canvas.create_image(x0, y0, image=image, anchor="nw")
+            canvas.create_image(x0, y0, image=image, anchor="nw", tags=("distribution",))
+        canvas.tag_lower("distribution", "surface-layer")
 
     def pick_location(self, event):
         if self.records.coordinates is None:
-            for tag in self.canvas.gettags("current"):
-                if tag.startswith("point-"):
-                    self.records.select_point(int(tag.removeprefix("point-")))
-                    return
+            # Hit-test the click itself; Tk's current item can be lost after a redraw.
+            items = self.canvas.find_overlapping(event.x - 3, event.y - 3, event.x + 3, event.y + 3)
+            for item in reversed(items):
+                for tag in self.canvas.gettags(item):
+                    if tag.startswith("point-"):
+                        self.records.select_point(int(tag.removeprefix("point-")))
+                        return
         left, top, scale = self.bounds
         longitude = (event.x - left) / scale - 180
         latitude = 90 - (event.y - top) / scale
@@ -665,11 +696,8 @@ class ElementMap:
 
     def measurements_changed(self):
         self.measurement_revision += 1
-        if self.surface is not None:
-            self.clear_surface()
-            self.legend.configure(text="Measurements changed. Select Calculate to update the distribution.")
-        else:
-            self.schedule_redraw(1)
+        self.selection_changed()
+        self.schedule_redraw(1)
 
 
 
