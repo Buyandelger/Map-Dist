@@ -1,5 +1,6 @@
 import unittest
 from concurrent.futures import Future
+from datetime import date
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -18,7 +19,9 @@ class SelectionTests(unittest.TestCase):
         app.clear_button = Mock()
         app.refresh_calculate = Mock()
         app.draw_points = Mock()
-        app.records = SimpleNamespace(point_id=1, element_id=10)
+        app.records = SimpleNamespace(point_id=1, element_id=10, active_date=date(2026, 1, 1))
+        app.playback_selecting = False
+        app.stop_playback = Mock()
         app.map_selection = 1
         app.distribution_selection = (1, 9, 0)
         app.distribution_request = 1

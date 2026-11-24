@@ -1,6 +1,6 @@
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 
 
 def parse_timestamp(timestamp):
@@ -58,7 +58,14 @@ class Reading:
 
     @classmethod
     def from_form(cls, element_id, timestamp, value):
-        timestamp = parse_timestamp(timestamp)
+        timestamp = timestamp.strip()
+        if len(timestamp) == 10:
+            try:
+                timestamp = date.fromisoformat(timestamp).isoformat()
+            except ValueError:
+                raise ValueError("Enter a date as YYYY-MM-DD.") from None
+        else:
+            timestamp = parse_timestamp(timestamp)
         if not value.strip():
             raise ValueError("Enter a value.")
         return cls(element_id, timestamp, value.strip())
@@ -111,6 +118,24 @@ class ElementStore:
                 """)
                 self.connection.execute("CREATE INDEX IF NOT EXISTS element_values_parent ON element_values(element_id)")
                 self.migrate_readings()
+                self.connection.execute("""
+                    CREATE TABLE IF NOT EXISTS measurement_dates (
+                        id INTEGER PRIMARY KEY, day TEXT NOT NULL UNIQUE
+                    )
+                """)
+                self.connection.execute("""
+                    INSERT OR IGNORE INTO measurement_dates (day)
+                    SELECT DISTINCT substr(recorded_at, 1, 10) FROM element_values
+                """)
+                for event in ("INSERT", "UPDATE OF recorded_at"):
+                    trigger = "insert" if event == "INSERT" else "update"
+                    self.connection.execute(f"""
+                        CREATE TRIGGER IF NOT EXISTS register_reading_date_{trigger}
+                        AFTER {event} ON element_values
+                        BEGIN
+                            INSERT OR IGNORE INTO measurement_dates (day) VALUES (substr(NEW.recorded_at, 1, 10));
+                        END
+                    """)
                 if self.connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
                     raise ValueError("The database contains readings with missing parent records.")
             self.connection.execute("PRAGMA foreign_keys = ON")
@@ -169,6 +194,45 @@ class ElementStore:
     def load_points(self):
         rows = self.connection.execute("SELECT id, name, latitude, longitude FROM points ORDER BY id")
         return {identifier: Point(*values) for identifier, *values in rows}
+
+    def load_dates(self):
+        return {identifier: date.fromisoformat(day) for identifier, day in self.connection.execute(
+            "SELECT id, day FROM measurement_dates ORDER BY day DESC")}
+
+    def save_date(self, day, identifier=None):
+        try:
+            day = date.fromisoformat(day.strip()).isoformat()
+        except ValueError:
+            raise ValueError("Enter a date as YYYY-MM-DD.") from None
+        try:
+            with self.connection:
+                self.connection.execute("BEGIN IMMEDIATE")
+                if identifier is None:
+                    return self.connection.execute("INSERT INTO measurement_dates (day) VALUES (?)", (day,)).lastrowid
+                previous = self.read_date(identifier)
+                self.connection.execute("UPDATE measurement_dates SET day = ? WHERE id = ?", (day, identifier))
+                self.connection.execute("""
+                    UPDATE element_values SET recorded_at = ? || substr(recorded_at, 11)
+                    WHERE substr(recorded_at, 1, 10) = ?
+                """, (day, previous))
+                return identifier
+        except sqlite3.IntegrityError as error:
+            if "measurement_dates.day" in str(error):
+                raise ValueError("This date already exists.") from None
+            raise
+
+    def read_date(self, identifier):
+        row = self.connection.execute("SELECT day FROM measurement_dates WHERE id = ?", (identifier,)).fetchone()
+        if row is None:
+            raise ValueError("This date no longer exists.")
+        return row[0]
+
+    def delete_date(self, identifier):
+        with self.connection:
+            self.connection.execute("BEGIN IMMEDIATE")
+            day = self.read_date(identifier)
+            self.connection.execute("DELETE FROM element_values WHERE substr(recorded_at, 1, 10) = ?", (day,))
+            self.connection.execute("DELETE FROM measurement_dates WHERE id = ?", (identifier,))
 
     def load_elements(self):
         rows = self.connection.execute("SELECT id, point_id, name FROM element_groups ORDER BY id")

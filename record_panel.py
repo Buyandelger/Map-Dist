@@ -1,7 +1,7 @@
 import csv
 import sqlite3
 import tkinter as tk
-from datetime import datetime
+from datetime import date
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from xml.etree.ElementTree import ParseError
@@ -84,11 +84,16 @@ class RecordPanel:
         self.editor = None
         self.coordinates = None
         self.last_coordinates = ""
+        self.active_date = self.date_id = None
         parent.columnconfigure(0, weight=1)
         ttk.Button(parent, text="Import spreadsheet…", command=self.import_spreadsheet).grid(
-            row=0, column=0, sticky="e", pady=(0, 8))
-        for row in range(1, 4):
+            row=0, column=0, sticky="e", pady=(0, 6))
+        for row in range(1, 5):
             parent.rowconfigure(row, weight=1)
+        self.date_list = RecordList(
+            parent, "Dates", (("day", "Date", 255),),
+            (lambda: self.edit_date(False), self.edit_date, self.delete_date), self.date_selected,
+        )
         self.point_list = RecordList(
             parent, "Points", (("name", "Name", 105), ("coordinates", "Latitude, longitude", 157)),
             (lambda: self.edit_point(False), self.edit_point, self.delete_point), self.point_selected,
@@ -101,10 +106,14 @@ class RecordPanel:
             parent, "Values", (("date", "Date and time", 145), ("value", "Value", 110)),
             (lambda: self.edit_value(False), self.edit_value, self.delete_value), self.value_selected,
         )
-        for row, section in enumerate((self.point_list, self.element_list, self.value_list), start=1):
+        self.show_all_elements = tk.BooleanVar(master=root)
+        ttk.Checkbutton(self.element_list.frame, text="Show all elements", variable=self.show_all_elements,
+                        command=lambda: self.show_elements(self.element_id)).pack(
+            before=self.element_list.tree.master, anchor="w")
+        for row, section in enumerate((self.date_list, self.point_list, self.element_list, self.value_list), start=1):
             section.frame.grid(row=row, column=0, sticky="nsew", pady=(0, 9))
         footer = ttk.Frame(parent)
-        footer.grid(row=4, column=0, sticky="ew")
+        footer.grid(row=5, column=0, sticky="ew")
         self.status = tk.StringVar()
         ttk.Label(footer, textvariable=self.status, wraplength=255).pack(side="left", fill="x", expand=True)
         self.calculate_button = ttk.Button(footer, text="Calculate", command=calculate, state="disabled")
@@ -114,26 +123,55 @@ class RecordPanel:
         self.points = self.store.load_points()
         self.elements = self.store.load_elements()
         self.readings = self.store.load_values()
+        self.dates = self.store.load_dates()
+        if reading_id in self.readings:
+            day = date.fromisoformat(self.readings[reading_id].recorded_at[:10])
+            self.date_id = next(key for key, value in self.dates.items() if value == day)
+        self.date_list.replace({key: (day.isoformat(),) for key, day in self.dates.items()}, self.date_id)
+        self.date_id = self.date_list.selected_id()
+        self.active_date = self.dates.get(self.date_id)
+        self.date_list.update_actions(True)
         rows = {key: (point.name, f"{point.latitude:.6f}, {point.longitude:.6f}" if point.located else "Not set")
                 for key, point in self.points.items()}
         self.point_list.replace(rows, point_id)
         self.point_id = self.point_list.selected_id()
         self.point_list.update_actions(True)
-        self.show_elements(element_id, reading_id)
+        self.show_elements(element_id, reading_id, include_selected=True)
 
-    def show_elements(self, element_id=None, reading_id=None):
+    def show_elements(self, element_id=None, reading_id=None, *, include_selected=False):
+        day = self.active_date.isoformat() if self.active_date is not None else None
+        visible = {reading.element_id for reading in self.readings.values() if reading.recorded_at[:10] == day}
+        if include_selected:
+            visible.add(element_id)
+        show_all = self.show_all_elements.get()
         self.element_list.replace({key: (element.name,) for key, element in self.elements.items()
-                                   if element.point_id == self.point_id}, element_id)
+                                   if element.point_id == self.point_id and (show_all or key in visible)}, element_id)
         self.element_id = self.element_list.selected_id()
-        self.element_list.update_actions(self.point_id is not None)
+        self.element_list.update_actions(self.point_id is not None and self.active_date is not None)
         self.show_values(reading_id)
 
     def show_values(self, reading_id=None):
+        day = self.active_date.isoformat() if self.active_date is not None else None
         self.value_list.replace({key: (reading.recorded_at, reading.value)
                                  for key, reading in reversed(self.readings.items())
-                                 if reading.element_id == self.element_id}, reading_id)
-        self.value_list.update_actions(self.element_id is not None)
+                                 if reading.element_id == self.element_id
+                                 and reading.recorded_at[:10] == day}, reading_id)
+        self.value_list.update_actions(self.element_id is not None and self.active_date is not None)
         self.on_selection()
+
+    def set_date(self, day):
+        self.date_id = next(key for key, value in self.dates.items() if value == day)
+        self.date_list.select(self.date_id)
+        self.active_date = day
+        self.show_elements(self.element_id, include_selected=True)
+
+    def date_selected(self, event=None):
+        selected = self.date_list.selected_id()
+        if selected != self.date_id:
+            self.date_id = selected
+            self.active_date = self.dates.get(selected)
+            self.status.set("")
+            self.show_elements(self.element_id)
 
     def point_selected(self, event=None):
         selected = self.point_list.selected_id()
@@ -151,12 +189,12 @@ class RecordPanel:
         selected = self.element_list.selected_id()
         if selected != self.element_id:
             self.element_id = selected
-            self.element_list.update_actions(self.point_id is not None)
+            self.element_list.update_actions(self.point_id is not None and self.active_date is not None)
             self.status.set("")
             self.show_values()
 
     def value_selected(self, event=None):
-        self.value_list.update_actions(self.element_id is not None)
+        self.value_list.update_actions(self.element_id is not None and self.active_date is not None)
 
     def select_point(self, identifier):
         self.point_list.select(identifier)
@@ -183,6 +221,25 @@ class RecordPanel:
             messagebox.showerror("Could not open spreadsheet", str(error), parent=self.root)
             return
         ImportDialog(self.root, Path(path).name, samples, self.points, self.store, self.import_completed)
+
+    def edit_date(self, edit=True):
+        identifier = self.date_list.selected_id() if edit else None
+        if edit and identifier is None:
+            return
+        day = self.dates.get(identifier, date.today())
+        title = "Edit Date" if edit else "Add Date"
+        label = "New date for all readings (YYYY-MM-DD)" if edit else "Date (YYYY-MM-DD)"
+
+        def save(value):
+            self.date_id = self.store.save_date(value, identifier)
+            return self.point_id, self.element_id if edit else None, None
+
+        self.open_editor(title, ((label, day.isoformat()),), save)
+
+    def delete_date(self):
+        if self.date_id is not None:
+            self.confirm_delete("Delete Date", f"Delete {self.active_date} and all readings on that date?",
+                                self.store.delete_date, self.date_id, self.point_id)
 
     def import_completed(self, result):
         self.reload(result.first_point)
@@ -281,17 +338,21 @@ class RecordPanel:
     def edit_value(self, edit=True):
         point_id, element_id = self.point_id, self.element_id
         identifier = self.value_list.selected_id() if edit else None
-        if element_id is None or (edit and identifier is None):
+        if self.active_date is None or element_id is None or (edit and identifier is None):
             return
         reading = self.readings.get(identifier)
-        timestamp = reading.recorded_at if reading else datetime.now().strftime("%Y-%m-%d %H:%M")
+        day = self.active_date.isoformat()
+        time = reading.recorded_at[11:] if reading else ""
 
-        def save(date, value):
-            record = Reading.from_form(element_id, date, value)
+        def save(value, time):
+            time = time.strip()
+            timestamp = f"{day} {time}" if time else day
+            record = Reading.from_form(element_id, timestamp, value)
             return point_id, element_id, self.store.save_value(record, identifier)
 
-        self.open_editor("Edit Value" if edit else "Add Value",
-                         (("Date and time (YYYY-MM-DD HH:MM)", timestamp), ("Value", reading.value if reading else "")), save)
+        title = "Edit Value" if edit else "Add Value"
+        self.open_editor(f"{title} · {day}",
+                         (("Value", reading.value if reading else ""), ("Time (optional, HH:MM)", time)), save)
 
     def delete_point(self):
         if self.point_id is not None:

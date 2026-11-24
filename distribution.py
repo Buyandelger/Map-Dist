@@ -94,12 +94,12 @@ def interpolate(x, y, samples):
     return math.fsum((weight / total) * value for weight, value in weights)
 
 
-def calculate_surface(points, elements, selected_id, name):
+def calculate_surface(points, elements, selected_id, name, *, require_selected=True):
     center = points[selected_id]
     if not center.located:
         raise ValueError("Set coordinates on the selected Point before calculating IDW.")
     measurements = numeric_measurements(elements, name)
-    if selected_id not in measurements:
+    if require_selected and selected_id not in measurements:
         raise ValueError("The selected Point needs a numeric value for this Element.")
     longitude_scale = max(0.001, math.cos(math.radians(center.latitude)))
     locations = defaultdict(list)
@@ -117,7 +117,7 @@ def calculate_surface(points, elements, selected_id, name):
     xs, ys, values = zip(*samples)
     span = max(max(xs) - min(xs), max(ys) - min(ys), 0.000001)
     margin = span * 0.12
-    cell = (span + 2 * margin) / 96
+    cell = (span + 2 * margin) / 384
     xmin, ymin = min(xs) - margin, min(ys) - margin
     width = math.ceil((max(xs) + margin - xmin) / cell)
     height = math.ceil((max(ys) + margin - ymin) / cell)

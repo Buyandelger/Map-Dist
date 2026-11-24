@@ -2,12 +2,13 @@ import json
 import math
 import tkinter as tk
 from concurrent.futures import Future
+from datetime import date
 from pathlib import Path
 from threading import Thread
 from tkinter import messagebox, ttk
 
 from detailed_contours import contour_interval as online_contour_interval, load_contours
-from distribution import calculate_surface, numeric_value, png_image, raster_color
+from distribution import calculate_surface, numeric_measurements, png_image, raster_color
 from online_water import load_water, tile_request
 from record_panel import RecordPanel
 from records import ElementStore
@@ -92,16 +93,21 @@ class ElementMap:
         self.distribution_selection = None
         self.measurement_revision = 0
         self.map_selection = None
+        self.playback_days = None
+        self.playback_job = None
+        self.playback_limits = None
+        self.playback_selecting = False
 
         root.title("Element Map")
         root.geometry("1180x790")
         root.minsize(720, 700)
-        panes = ttk.Panedwindow(root, orient="horizontal")
-        panes.pack(fill="both", expand=True)
-        map_panel = ttk.Frame(panes, padding=18)
-        form = ttk.Frame(panes, padding=18)
-        panes.add(map_panel, weight=3)
-        panes.add(form, weight=2)
+        root.rowconfigure(0, weight=1)
+        root.columnconfigure(0, weight=3, uniform="main")
+        root.columnconfigure(1, weight=1, uniform="main", minsize=295)
+        map_panel = ttk.Frame(root, padding=18)
+        form = ttk.Frame(root, padding=10)
+        map_panel.grid(row=0, column=0, sticky="nsew")
+        form.grid(row=0, column=1, sticky="nsew")
 
         ttk.Label(map_panel, text="World map", font=("TkDefaultFont", 16, "bold")).pack(anchor="w")
         ttk.Label(map_panel, text="Scroll to zoom. Drag to move the map. Click to select a Point or pick coordinates.",
@@ -112,11 +118,13 @@ class ElementMap:
         map_view.columnconfigure(0, weight=1)
         self.canvas = tk.Canvas(map_view, background=OCEAN, highlightthickness=0)
         self.canvas.grid(row=0, column=0, sticky="nsew")
-        self.horizontal_scroll = ttk.Scrollbar(map_view, orient="horizontal",
-                                               command=lambda *args: self.scroll_map(0, *args))
+        scrollbar_colors = dict(background="#529494", activebackground="#357578", troughcolor="#dcebed",
+                                highlightthickness=0, borderwidth=0, relief="flat", width=14)
+        self.horizontal_scroll = tk.Scrollbar(map_view, orient="horizontal",
+                                              command=lambda *args: self.scroll_map(0, *args), **scrollbar_colors)
         self.horizontal_scroll.grid(row=1, column=0, sticky="ew")
-        self.vertical_scroll = ttk.Scrollbar(map_view, orient="vertical",
-                                             command=lambda *args: self.scroll_map(1, *args))
+        self.vertical_scroll = tk.Scrollbar(map_view, orient="vertical",
+                                            command=lambda *args: self.scroll_map(1, *args), **scrollbar_colors)
         self.vertical_scroll.grid(row=0, column=1, sticky="ns")
         self.canvas.bind("<Configure>", self.draw_map)
         self.canvas.bind("<MouseWheel>", self.zoom_map)
@@ -146,8 +154,14 @@ class ElementMap:
         self.water_info.pack(anchor="w")
         self.legend = ttk.Label(map_panel, wraplength=350)
         self.legend.pack(anchor="w", pady=(6, 0))
-        self.clear_button = ttk.Button(map_panel, text="Clear distribution", command=self.clear_surface, state="disabled")
-        self.clear_button.pack(anchor="w", pady=(3, 0))
+        distribution_actions = ttk.Frame(map_panel)
+        distribution_actions.pack(anchor="w", pady=(3, 0))
+        self.clear_button = ttk.Button(distribution_actions, text="Clear distribution",
+                                       command=self.clear_distribution, state="disabled")
+        self.clear_button.pack(side="left")
+        self.play_button = ttk.Button(distribution_actions, text="Play dates", command=self.toggle_playback,
+                                      state="disabled")
+        self.play_button.pack(side="left", padx=(5, 0))
         ttk.Label(map_panel, text="Map data: Natural Earth · Elevation: GMT Earth Relief").pack(anchor="w", pady=(8, 0))
         ttk.Label(map_panel, text="OpenFreeMap · © OpenMapTiles · © OpenStreetMap contributors",
                   wraplength=340).pack(anchor="w")
@@ -560,28 +574,88 @@ class ElementMap:
         if self.map_selection != self.records.point_id:
             self.map_selection = self.records.point_id
             self.draw_points()
-        selection = (self.records.point_id, self.records.element_id, self.measurement_revision)
+        selection = (self.records.point_id, self.records.element_id, self.measurement_revision,
+                     self.records.active_date)
         if selection != self.distribution_selection:
             self.distribution_selection = selection
-            self.clear_surface()
-            self.distribution_job = self.root.after(120, self.calculate_distribution)
+            if not self.playback_selecting:
+                self.stop_playback()
+                self.clear_surface()
+                self.distribution_job = self.root.after(120, self.calculate_distribution)
         self.refresh_calculate()
 
     def refresh_calculate(self):
         element_id = self.records.element_id
         point = self.records.points.get(self.records.point_id)
-        eligible = point is not None and point.located and element_id is not None and not self.pending and any(
-            reading.element_id == element_id and numeric_value(reading.value) is not None
-            for reading in self.records.readings.values()
-        )
-        self.records.calculate_button.state(["!disabled"] if eligible else ["disabled"])
+        eligible = (point is not None and point.located and element_id is not None
+                    and self.records.active_date is not None)
+        can_calculate = eligible and not self.pending and self.playback_days is None
+        self.records.calculate_button.state(["!disabled"] if can_calculate else ["disabled"])
+        self.play_button.state(["!disabled"] if eligible else ["disabled"])
+
+    def toggle_playback(self):
+        if self.playback_days is not None:
+            self.stop_playback()
+            return
+        element = self.records.elements.get(self.records.element_id)
+        if element is None:
+            return
+        by_day = {}
+        for measurement in self.store.load_measurements():
+            if measurement.name.casefold() == element.name.casefold():
+                day = date.fromisoformat(measurement.recorded_at[:10])
+                by_day.setdefault(day, []).append(measurement)
+        days, values = [], []
+        for day, measurements in sorted(by_day.items()):
+            readings = numeric_measurements(measurements, element.name)
+            points = self.records.points
+            located = {identifier: value for identifier, value in readings.items() if points[identifier].located}
+            coordinates = {(points[identifier].latitude, (points[identifier].longitude + 180) % 360)
+                           for identifier in located}
+            if len(coordinates) >= 2:
+                days.append(day)
+                values.extend(located.values())
+        if len(days) < 2:
+            self.records.status.set("Playback needs at least two dates with numeric readings at two locations each.")
+            return
+        self.clear_surface()
+        self.records.status.set("")
+        self.playback_days = iter(days)
+        self.playback_limits = min(values), max(values)
+        self.play_button.configure(text="Stop playback")
+        self.advance_playback()
+
+    def advance_playback(self):
+        self.playback_job = None
+        day = next(self.playback_days, None)
+        if day is None:
+            self.stop_playback()
+            return
+        self.playback_selecting = True
+        try:
+            self.records.set_date(day)
+        finally:
+            self.playback_selecting = False
+        self.calculate_distribution()
+
+    def stop_playback(self):
+        if self.playback_job is not None:
+            self.root.after_cancel(self.playback_job)
+            self.playback_job = None
+        self.playback_days = self.playback_limits = None
+        self.play_button.configure(text="Play dates")
+        self.refresh_calculate()
+
+    def clear_distribution(self):
+        self.stop_playback()
+        self.clear_surface()
 
     def calculate_distribution(self):
         if self.distribution_job is not None:
             self.root.after_cancel(self.distribution_job)
             self.distribution_job = None
         element = self.records.elements.get(self.records.element_id)
-        if self.pending or element is None:
+        if self.pending or element is None or self.records.active_date is None:
             return
         point = self.records.points.get(element.point_id)
         if point is None or not point.located:
@@ -592,13 +666,21 @@ class ElementMap:
         point_id, metric = element.point_id, element.name
         self.pending = True
         self.refresh_calculate()
-        self.legend.configure(text=f"Calculating {metric}…")
+        day = self.records.active_date.isoformat()
+        if self.surface is None:
+            self.legend.configure(text=f"Calculating {metric} for {day}…")
         future = Future()
-        points, measurements = self.records.points.copy(), self.store.load_measurements()
+        points = self.records.points.copy()
+        measurements = [reading for reading in self.store.load_measurements() if reading.recorded_at[:10] == day]
+        color_limits = self.playback_limits
 
         def calculate():
             try:
-                future.set_result(calculate_surface(points, measurements, point_id, metric))
+                surface = calculate_surface(points, measurements, point_id, metric, require_selected=False)
+                minimum, maximum = color_limits or (surface.minimum, surface.maximum)
+                colors = [[raster_color(value, minimum, maximum) for value in row]
+                          for row in surface.rows]
+                future.set_result((surface, colors, minimum, maximum))
             except Exception as error:
                 future.set_exception(error)
 
@@ -614,20 +696,26 @@ class ElementMap:
         self.pending = False
         self.refresh_calculate()
         try:
-            surface = future.result()
+            surface, colors, minimum, maximum = future.result()
         except Exception as error:
-            self.legend.configure(text=f"{metric}: {error}")
+            self.clear_distribution()
+            self.legend.configure(text=f"{metric} · {self.records.active_date}: {error}")
             return
+        focus = self.playback_days is not None and self.surface is None and self.zoom == 1
         self.surface = surface
-        self.surface_colors = [[raster_color(value, surface.minimum, surface.maximum) for value in row]
-                               for row in surface.rows]
-        limits = (f"Blue {surface.minimum:g} → Red {surface.maximum:g}" if surface.minimum != surface.maximum
-                  else f"Constant value {surface.minimum:g}")
-        self.surface_caption = f"{point_name} · {metric} | {surface.engine} | {surface.samples} locations\n{limits}"
+        self.surface_colors = colors
+        limits = f"Blue {minimum:g} → Red {maximum:g}" if minimum != maximum else f"Constant value {minimum:g}"
+        self.surface_caption = (f"{point_name} · {metric} · {self.records.active_date}\n"
+                                f"{surface.engine} | {surface.samples} locations\n{limits}")
         self.legend.configure(text=self.surface_caption)
         self.clear_button.state(["!disabled"])
-        self.canvas.delete("distribution")
-        self.draw_surface()
+        if focus:
+            self.focus_surface(surface)
+        else:
+            self.canvas.delete("distribution")
+            self.draw_surface()
+        if self.playback_days is not None and self.playback_job is None:
+            self.playback_job = self.root.after(850, self.advance_playback)
 
     def focus_surface(self, surface):
         width, height = self.canvas.winfo_width(), self.canvas.winfo_height()
